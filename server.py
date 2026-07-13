@@ -1,6 +1,7 @@
 import os, sys
 from datetime import datetime
 from http.cookiejar import MozillaCookieJar
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -8,6 +9,8 @@ import asyncio
 import lancedb
 import logging
 import requests
+import subprocess
+import tempfile
 from dotenv import load_dotenv
 from langchain_community.tools import YouTubeSearchTool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -156,6 +159,64 @@ async def serve(read, write, options):
             logger.info("Loaded YouTube cookies from %s", resolved)
         return session
 
+    def parse_vtt_text(vtt_text: str) -> str:
+        """Convert a VTT file into plain text."""
+        lines = []
+        for raw_line in vtt_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("WEBVTT") or line.startswith("NOTE"):
+                continue
+            if "-->" in line:
+                continue
+            if line.isdigit():
+                continue
+            lines.append(line)
+        return clean_text(" ".join(lines).strip())
+
+    def fetch_transcript_via_ytdlp(video_url: str, languages: Optional[List[str]] = None, cookie_file: Optional[str] = None) -> tuple[str, str]:
+        """Fallback transcript fetch using yt-dlp auto captions."""
+        languages = languages or ["pt", "pt-BR", "en"]
+        cookie = resolve_cookie_file(cookie_file)
+        with tempfile.TemporaryDirectory(prefix="youtube-mcp-") as tmpdir:
+            cmd = [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--cookies",
+                cookie,
+                "--write-auto-subs",
+                "--sub-langs",
+                ",".join(languages),
+                "--skip-download",
+                "--ignore-no-formats-error",
+                "--no-playlist",
+                "-o",
+                str(Path(tmpdir) / "%(id)s.%(ext)s"),
+                video_url,
+            ]
+            cmd = [part for part in cmd if part is not None]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode != 0:
+                raise RuntimeError((completed.stderr or completed.stdout or "yt-dlp failed").strip())
+
+            vtt_files = sorted(Path(tmpdir).glob("*.vtt"))
+            if not vtt_files:
+                raise RuntimeError("yt-dlp did not produce any subtitle files")
+
+            chosen = None
+            for language in languages:
+                matches = [p for p in vtt_files if f".{language}." in p.name or p.name.endswith(f".{language}.vtt")]
+                if matches:
+                    chosen = matches[0]
+                    break
+            if chosen is None:
+                chosen = vtt_files[0]
+
+            transcript_text = parse_vtt_text(chosen.read_text(encoding="utf-8", errors="ignore"))
+            if not transcript_text:
+                raise RuntimeError("yt-dlp subtitle file was empty")
+            return transcript_text, f"yt-dlp:{chosen.name}"
+
     def fetch_transcript_text(video_url: str, languages: Optional[List[str]] = None, cookie_file: Optional[str] = None) -> tuple[str, str]:
         """Fetch transcript text using youtube-transcript-api with cookie fallback."""
         languages = languages or ["pt", "pt-BR", "en"]
@@ -189,7 +250,13 @@ async def serve(read, write, options):
                     return transcript_text, source
                 attempts.append("youtube-transcript-api returned an empty transcript")
             except Exception as exc:
-                attempts.append(f"{candidate_cookie or 'public'}: {exc}")
+                attempts.append(f"api:{candidate_cookie or 'public'}: {exc}")
+
+        try:
+            transcript_text, source = fetch_transcript_via_ytdlp(video_url, languages=languages, cookie_file=cookie_file)
+            return transcript_text, source
+        except Exception as exc:
+            attempts.append(f"ytdlp:{exc}")
 
         raise RuntimeError("; ".join(attempts) if attempts else "Transcript not found")
 
