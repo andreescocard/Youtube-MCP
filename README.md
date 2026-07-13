@@ -62,6 +62,13 @@ uv pip install -r requirements.txt
 GOOGLE_API_KEY=your_api_key_here
 ```
 
+If YouTube blocks transcript access in your environment, also set one of these:
+```
+YOUTUBE_COOKIES_FILE=/absolute/path/to/cookies.txt
+```
+
+The cookie file should be a Netscape-format export from a logged-in YouTube browser session. Do not paste the cookie contents into chat.
+
 ## Running the Server
 
 There are two ways to run the MCP server:

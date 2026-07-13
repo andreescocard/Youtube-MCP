@@ -1,17 +1,21 @@
 import os, sys
-from typing import List
+from datetime import datetime
+from http.cookiejar import MozillaCookieJar
+from typing import List, Optional
+from urllib.parse import parse_qs, urlparse
+
+import asyncio
+import lancedb
+import logging
+import requests
+from dotenv import load_dotenv
+from langchain_community.tools import YouTubeSearchTool
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from mcp.server import Server
-from mcp.types import Tool, TextContent, ListToolsResult, INVALID_PARAMS
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
-from langchain_community.tools import YouTubeSearchTool
-from langchain_community.document_loaders import YoutubeLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import lancedb
-import asyncio
-from dotenv import load_dotenv
-import logging
-from datetime import datetime
+from mcp.types import INVALID_PARAMS, ListToolsResult, TextContent, Tool
+from youtube_transcript_api import YouTubeTranscriptApi
 
 DATA_DIR = "./data"
 
@@ -92,6 +96,103 @@ async def serve(read, write, options):
         except Exception:
             return str(text)
 
+    def extract_video_id(video_url: str) -> str:
+        """Normalize common YouTube URL formats into a video id."""
+        if len(video_url) == 11 and "/" not in video_url and "?" not in video_url:
+            return video_url
+
+        parsed = urlparse(video_url)
+        query = parse_qs(parsed.query)
+        if "v" in query and query["v"]:
+            return query["v"][0]
+
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if not path_parts:
+            return video_url
+
+        if path_parts[0] == "shorts" and len(path_parts) >= 2:
+            return path_parts[1]
+        if path_parts[0] == "embed" and len(path_parts) >= 2:
+            return path_parts[1]
+        return path_parts[-1]
+
+    def resolve_cookie_file(explicit_path: Optional[str] = None) -> Optional[str]:
+        """Resolve a Netscape cookie jar from env vars or a caller-supplied path."""
+        candidates = [
+            explicit_path,
+            os.getenv("YOUTUBE_COOKIES_FILE"),
+            os.getenv("YOUTUBE_COOKIE_FILE"),
+            os.getenv("YOUTUBE_COOKIES_PATH"),
+            os.getenv("YT_DLP_COOKIES_FILE"),
+            os.path.join(os.getcwd(), "cookies.txt"),
+            os.path.join(os.getcwd(), "youtube-cookies.txt"),
+            os.path.expanduser("~/.config/youtube-mcp/cookies.txt"),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            expanded = os.path.expanduser(candidate)
+            if os.path.isfile(expanded):
+                return expanded
+        return None
+
+    def build_http_client(cookie_file: Optional[str] = None) -> requests.Session:
+        """Build a requests session with optional cookies loaded."""
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            }
+        )
+        resolved = resolve_cookie_file(cookie_file)
+        if resolved:
+            jar = MozillaCookieJar()
+            jar.load(resolved, ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+            logger.info("Loaded YouTube cookies from %s", resolved)
+        return session
+
+    def fetch_transcript_text(video_url: str, languages: Optional[List[str]] = None, cookie_file: Optional[str] = None) -> tuple[str, str]:
+        """Fetch transcript text using youtube-transcript-api with cookie fallback."""
+        languages = languages or ["pt", "pt-BR", "en"]
+        video_id = extract_video_id(video_url)
+        attempts: list[str] = []
+
+        for candidate_cookie in (None, cookie_file):
+            try:
+                api = YouTubeTranscriptApi(
+                    http_client=build_http_client(candidate_cookie)
+                    if resolve_cookie_file(candidate_cookie)
+                    else None
+                )
+                fetched = api.fetch(video_id, languages=languages)
+                snippets = getattr(fetched, "snippets", None)
+                if snippets is None:
+                    snippets = list(fetched)
+                transcript_lines = []
+                for snippet in snippets:
+                    text = getattr(snippet, "text", None)
+                    if text is None and isinstance(snippet, dict):
+                        text = snippet.get("text")
+                    if not text:
+                        continue
+                    transcript_lines.append(text.strip())
+                transcript_text = clean_text("\n".join(transcript_lines).strip())
+                if transcript_text:
+                    source = "youtube-transcript-api"
+                    if resolve_cookie_file(candidate_cookie):
+                        source += "+cookies"
+                    return transcript_text, source
+                attempts.append("youtube-transcript-api returned an empty transcript")
+            except Exception as exc:
+                attempts.append(f"{candidate_cookie or 'public'}: {exc}")
+
+        raise RuntimeError("; ".join(attempts) if attempts else "Transcript not found")
+
     # Register the list_tools handler
     @server.list_tools()
     async def list_tools() -> List[Tool]:
@@ -116,7 +217,17 @@ async def serve(read, write, options):
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "video_url": {"type": "string", "description": "URL of the YouTube video"}
+                        "video_url": {"type": "string", "description": "URL of the YouTube video"},
+                        "cookies_path": {
+                            "type": "string",
+                            "description": "Optional path to a Netscape cookies.txt export for authenticated transcript access"
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Preferred transcript languages in order",
+                            "default": ["pt", "pt-BR", "en"]
+                        }
                     },
                     "required": ["video_url"]
                 }
@@ -128,6 +239,16 @@ async def serve(read, write, options):
                     "type": "object",
                     "properties": {
                         "video_url": {"type": "string", "description": "URL of the YouTube video"},
+                        "cookies_path": {
+                            "type": "string",
+                            "description": "Optional path to a Netscape cookies.txt export for authenticated transcript access"
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Preferred transcript languages in order",
+                            "default": ["pt", "pt-BR", "en"]
+                        },
                         "metadata": {"type": "object", "description": "Optional metadata about the video"}
                     },
                     "required": ["video_url"]
@@ -164,61 +285,48 @@ async def serve(read, write, options):
                 return [TextContent(type="text", text=cleaned_results)]
             
             elif name == "get-transcript":
-                languages = ["en", "es", "fr", "pt", "it", "id", "de", "zh", "ko", "ja", "ar", "hi", "bn", "sw", "yo"]  # English, Spanish, French, Portuguese, Italian, Indonesian, German, Chinese, Korean, Japanese, Arabic, Hindi, Bengali, Swahili, Yoruba
-                # Extract video_id from URL, handling URLs with additional parameters
-                video_url = arguments["video_url"] if len(arguments["video_url"].split("&")) == 1 else arguments["video_url"].split("&")[0]  # Extract video_id from URL when the url is like https://www.youtube.com/watch?v=VIDEO_ID&...
-                # Use YoutubeLoader with languages parameter
-                loader = YoutubeLoader.from_youtube_url(
-                    youtube_url=video_url,
-                    language=languages,
-                    add_video_info=False,
-                    continue_on_failure=True
+                languages = arguments.get("languages") or ["pt", "pt-BR", "en"]
+                video_url = arguments["video_url"]
+                transcript_text, source = fetch_transcript_text(
+                    video_url=video_url,
+                    languages=languages,
+                    cookie_file=arguments.get("cookies_path"),
                 )
-                # Load transcript and extract text
-                documents = loader.load()
-                if documents:
-                    transcript_text = documents[0].page_content
-                    cleaned_transcript = clean_text(transcript_text)
-                    return [TextContent(type="text", text=cleaned_transcript)]
-                else:
-                    return [TextContent(type="text", text="No transcript found for this video.")]
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"[source={source}]\n{transcript_text}",
+                    )
+                ]
             
             elif name == "store-video-info":
-                languages = ["en", "es", "fr", "pt", "it", "id", "de", "zh", "ko", "ja", "ar", "hi", "bn", "sw", "yo"]
-                # Extract video_id from URL, handling URLs with additional parameters
-                video_url = arguments["video_url"] if len(arguments["video_url"].split("&")) == 1 else arguments["video_url"].split("&")[0]  # Extract video_id from URL when the url is like https://www.youtube.com/watch?v=VIDEO_ID&...
-                # Use YoutubeLoader with languages parameter
-                loader = YoutubeLoader.from_youtube_url(
-                    youtube_url=video_url,
-                    language=languages,
-                    add_video_info=True,
-                    continue_on_failure=True
+                languages = arguments.get("languages") or ["pt", "pt-BR", "en"]
+                video_url = arguments["video_url"]
+                transcript_text, source = fetch_transcript_text(
+                    video_url=video_url,
+                    languages=languages,
+                    cookie_file=arguments.get("cookies_path"),
                 )
-                # Load transcript and extract text
-                documents = loader.load()
-                if documents:
-                    transcript_text = documents[0].page_content
-                    cleaned_content = clean_text(transcript_text)
-                    vector = embeddings.embed_documents(
-                        [cleaned_content],
-                        task_type="retrieval_document"
-                    )[0]
-                    # Use provided metadata and add video metadata from document if available
-                    cleaned_metadata = {
-                        k: clean_text(str(v)) if isinstance(v, str) else v
-                        for k, v in arguments.get("metadata", {}).items()
-                    }
-                    # Add video_id to metadata
-                    cleaned_metadata["video_id"] = YoutubeLoader.extract_video_id(youtube_url=video_url)
-                    videos_table.add([{
-                        "id": video_url,
-                        "text": cleaned_content,
-                        "metadata": cleaned_metadata,
-                        "vector": vector
-                    }])
-                    return [TextContent(type="text", text=f"Successfully stored video information for {cleaned_metadata.get('video_id')}")]
-                else:
-                    return [TextContent(type="text", text="No transcript found for this video.")]
+                cleaned_content = clean_text(transcript_text)
+                vector = embeddings.embed_documents(
+                    [cleaned_content],
+                    task_type="retrieval_document"
+                )[0]
+                # Use provided metadata and add video metadata from document if available
+                cleaned_metadata = {
+                    k: clean_text(str(v)) if isinstance(v, str) else v
+                    for k, v in arguments.get("metadata", {}).items()
+                }
+                # Add video_id to metadata
+                cleaned_metadata["video_id"] = extract_video_id(video_url)
+                cleaned_metadata["transcript_source"] = source
+                videos_table.add([{
+                    "id": video_url,
+                    "text": cleaned_content,
+                    "metadata": cleaned_metadata,
+                    "vector": vector
+                }])
+                return [TextContent(type="text", text=f"Successfully stored video information for {cleaned_metadata.get('video_id')} from {source}")]
                 
             elif name == "search-transcripts":
                 query_vector = embeddings.embed_query(

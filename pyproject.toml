@@ -22,6 +22,8 @@ dependencies = [
     "pydantic-core>=2.27.2",
     "python-dotenv>=1.0.0",
     "pytube2>=15.0.12",
+    "requests>=2.32.3",
+    "yt-dlp>=2024.12.13",
     "youtube-search>=2.1.2",
-    "youtube-transcript-api==0.6.3",
+    "youtube-transcript-api==1.2.4",
 ]
