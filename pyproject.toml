@@ -9,4 +9,5 @@ dependencies = [
     "requests>=2.31.0",
     "defusedxml>=0.7.1",
     "youtube-transcript-api>=1.0.0",
+    "yt-dlp>=2024.1.0",
 ]

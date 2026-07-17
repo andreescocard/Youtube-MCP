@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import json
+import time
 import asyncio
 import logging
 from typing import List, Optional
@@ -44,6 +45,30 @@ HTTP_HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Optional proxy — set YT_PROXY (or HTTPS_PROXY / HTTP_PROXY). Needed on cloud
+# hosts, whose datacenter IPs YouTube frequently blocks.
+_PROXY_URL = os.getenv("YT_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+# Optional Netscape cookie file — authenticated requests are blocked far less.
+_COOKIES = os.getenv("YT_COOKIES")
+# Transient IpBlocked errors recover — retry a few times with backoff.
+_RETRIES = int(os.getenv("YT_RETRIES", "3"))
+
+
+def _requests_proxies():
+    return {"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None
+
+
+def _proxy_config():
+    if not _PROXY_URL:
+        return None
+    try:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        return GenericProxyConfig(http_url=_PROXY_URL, https_url=_PROXY_URL)
+    except Exception as e:
+        logger.warning("Proxy config unavailable: %s", e)
+        return None
+
 
 RSS_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
 YT_NS = {
@@ -101,7 +126,7 @@ def resolve_channel_id(channel: str) -> str:
     else:
         page_url = f"https://www.youtube.com/@{s}"
 
-    resp = requests.get(page_url, headers=HTTP_HEADERS, timeout=20)
+    resp = requests.get(page_url, headers=HTTP_HEADERS, timeout=20, proxies=_requests_proxies())
     resp.raise_for_status()
     html = resp.text
     for pattern in (
@@ -118,7 +143,7 @@ def resolve_channel_id(channel: str) -> str:
 def fetch_channel_videos(channel: str, max_results: int = 10) -> List[dict]:
     """Return recent videos for a channel via its public RSS feed."""
     cid = resolve_channel_id(channel)
-    resp = requests.get(RSS_FEED.format(cid=cid), headers=HTTP_HEADERS, timeout=20)
+    resp = requests.get(RSS_FEED.format(cid=cid), headers=HTTP_HEADERS, timeout=20, proxies=_requests_proxies())
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
 
@@ -138,40 +163,145 @@ def fetch_channel_videos(channel: str, max_results: int = 10) -> List[dict]:
     return videos
 
 
-def _snippet_text(seg) -> str:
-    # 1.x yields snippet objects (seg.text); older/raw dicts use seg["text"].
-    text = getattr(seg, "text", None)
-    if text is None and isinstance(seg, dict):
-        text = seg.get("text", "")
-    return (text or "").replace("\n", " ")
+def _snippet_field(seg, name, default=None):
+    # 1.x yields snippet objects (seg.text); raw dicts use seg["text"].
+    val = getattr(seg, name, None)
+    if val is None and isinstance(seg, dict):
+        val = seg.get(name, default)
+    return default if val is None else val
 
 
-def _to_text(entries) -> str:
-    return " ".join(_snippet_text(s) for s in entries).strip()
+def _fmt_ts(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
-def fetch_transcript(video_id: str, languages: List[str]) -> str:
-    """Fetch a transcript (youtube-transcript-api 1.x), falling back to any language."""
-    api = YouTubeTranscriptApi()
+def format_transcript(snippets, include_timestamps: bool, max_chars: int) -> str:
+    """Render snippets to text, optionally timestamped, capped at max_chars (0 = no cap)."""
+    parts = []
+    for seg in snippets:
+        text = str(_snippet_field(seg, "text", "")).replace("\n", " ").strip()
+        if not text:
+            continue
+        if include_timestamps:
+            parts.append(f"[{_fmt_ts(float(_snippet_field(seg, 'start', 0.0)))}] {text}")
+        else:
+            parts.append(text)
+    out = ("\n" if include_timestamps else " ").join(parts).strip()
+    if max_chars and len(out) > max_chars:
+        out = out[:max_chars].rstrip() + f"\n\n[...truncated at {max_chars} chars; full length {len(out)}]"
+    return out
 
-    # Preferred languages first.
+
+def _is_block(err: Exception) -> bool:
+    name = type(err).__name__.lower()
+    return "block" in name or "block" in str(err).lower() or "too many requests" in str(err).lower()
+
+
+def _yta_snippets(video_id: str, languages: List[str]):
+    """Primary path: youtube-transcript-api, preferred language then any."""
+    api = YouTubeTranscriptApi(proxy_config=_proxy_config())
     try:
-        return _to_text(api.fetch(video_id, languages=languages))
-    except Exception as first_err:  # NoTranscriptFound / language mismatch, etc.
+        return list(api.fetch(video_id, languages=languages))
+    except Exception as first_err:
+        if _is_block(first_err):
+            raise
         logger.info("Preferred-language fetch failed for %s: %s", video_id, first_err)
-
-    # Fall back to whatever transcript exists (manual or auto-generated).
-    try:
-        listing = api.list(video_id)
-    except Exception as e:
-        raise RuntimeError(f"No transcript available for {video_id}: {e}")
-
+    listing = api.list(video_id)
     for tr in listing:
         try:
-            return _to_text(tr.fetch())
+            return list(tr.fetch())
         except Exception:
             continue
     raise RuntimeError(f"No fetchable transcript for {video_id}")
+
+
+def _parse_json3(data: dict):
+    snippets = []
+    for ev in data.get("events", []):
+        text = "".join(seg.get("utf8", "") for seg in ev.get("segs", []) if seg.get("utf8"))
+        if text.strip():
+            snippets.append({"text": text, "start": ev.get("tStartMs", 0) / 1000.0,
+                             "duration": ev.get("dDurationMs", 0) / 1000.0})
+    return snippets
+
+
+def _pick_caption_lang(tracks: dict, languages: List[str]) -> str:
+    """Choose a track: preferred code, then its base (pt-BR→pt), then any."""
+    for l in languages:
+        if l in tracks:
+            return l
+    for l in languages:
+        base = l.split("-")[0]
+        match = next((k for k in tracks if k.split("-")[0] == base), None)
+        if match:
+            return match
+    return next(iter(tracks))
+
+
+def _ytdlp_snippets(video_id: str, languages: List[str]):
+    """Fallback path: single metadata call, then fetch one json3 track via yt-dlp's session.
+
+    Uses yt-dlp networking (correct headers/consent) and hits ``timedtext`` only
+    once for the best-matching *original* language — minimises rate-limit exposure.
+    """
+    import yt_dlp
+
+    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    if _PROXY_URL:
+        opts["proxy"] = _PROXY_URL
+    if _COOKIES:
+        opts["cookiefile"] = _COOKIES
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        # Prefer manual subtitles over auto-generated for the same language.
+        tracks = {**(info.get("automatic_captions") or {}), **(info.get("subtitles") or {})}
+        if not tracks:
+            raise RuntimeError(f"yt-dlp found no captions for {video_id}")
+
+        lang = _pick_caption_lang(tracks, languages)
+        fmt = next((f for f in tracks[lang] if f.get("ext") == "json3"), None)
+        if fmt is None:
+            raise RuntimeError(f"No json3 caption format for {video_id} ({lang})")
+
+        raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", "replace")
+
+    data = json.loads(raw)
+    snippets = _parse_json3(data)
+    if not snippets:
+        raise RuntimeError(f"yt-dlp returned empty captions for {video_id}")
+    return snippets
+
+
+def get_snippets(video_id: str, languages: List[str]):
+    """Fetch snippets with retry-on-block, then yt-dlp fallback."""
+    last = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            return _yta_snippets(video_id, languages)
+        except Exception as e:
+            last = e
+            if _is_block(e) and attempt < _RETRIES:
+                wait = 2 ** attempt
+                logger.warning("Blocked on %s (attempt %d), retrying in %ds", video_id, attempt, wait)
+                time.sleep(wait)
+                continue
+            break
+
+    logger.info("yta path exhausted for %s (%s); trying yt-dlp fallback", video_id, last)
+    try:
+        return _ytdlp_snippets(video_id, languages)
+    except Exception as e:
+        raise RuntimeError(f"No transcript for {video_id}: yta={last}; yt-dlp={e}")
+
+
+def fetch_transcript(video_id: str, languages: List[str],
+                     include_timestamps: bool = False, max_chars: int = 0) -> str:
+    return format_transcript(get_snippets(video_id, languages), include_timestamps, max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +337,8 @@ async def list_tools() -> List[Tool]:
                         "items": {"type": "string"},
                         "description": "Preferred language codes, best first",
                     },
+                    "include_timestamps": {"type": "boolean", "description": "Prefix each line with [H:MM:SS]", "default": False},
+                    "max_chars": {"type": "integer", "description": "Cap output length; 0 = no cap", "default": 0},
                 },
                 "required": ["video_url"],
             },
@@ -224,6 +356,8 @@ async def list_tools() -> List[Tool]:
                         "items": {"type": "string"},
                         "description": "Preferred language codes, best first",
                     },
+                    "include_timestamps": {"type": "boolean", "description": "Prefix each line with [H:MM:SS]", "default": False},
+                    "max_chars": {"type": "integer", "description": "Cap each transcript length; 0 = no cap", "default": 0},
                 },
                 "required": ["channel"],
             },
@@ -235,6 +369,8 @@ async def list_tools() -> List[Tool]:
 async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     logger.info("Tool call: %s %s", name, arguments)
     languages = arguments.get("languages") or DEFAULT_LANGUAGES
+    ts = bool(arguments.get("include_timestamps", False))
+    max_chars = int(arguments.get("max_chars", 0))
 
     try:
         if name == "get-channel-videos":
@@ -247,7 +383,7 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
             vid = extract_video_id(arguments["video_url"])
             if not vid:
                 return [TextContent(type="text", text=f"Could not parse a video id from: {arguments['video_url']}")]
-            text = await asyncio.to_thread(fetch_transcript, vid, languages)
+            text = await asyncio.to_thread(fetch_transcript, vid, languages, ts, max_chars)
             return [TextContent(type="text", text=text or "No transcript found for this video.")]
 
         if name == "get-channel-transcripts":
@@ -256,7 +392,7 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
             out = []
             for v in videos:
                 try:
-                    text = await asyncio.to_thread(fetch_transcript, v["video_id"], languages)
+                    text = await asyncio.to_thread(fetch_transcript, v["video_id"], languages, ts, max_chars)
                 except Exception as e:
                     text = None
                     v["error"] = str(e)

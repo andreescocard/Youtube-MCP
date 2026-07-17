@@ -103,12 +103,38 @@ The server provides the following tools:
    - Parameters:
      - video_url: Video URL or 11-char video id
      - languages: Optional preferred language codes, best first
+     - include_timestamps: Prefix each line with `[H:MM:SS]` (default: false)
+     - max_chars: Cap output length; 0 = no cap (default: 0)
 
 3. `get-channel-transcripts`: Transcribe a channel's latest videos in one call
    - Parameters:
      - channel: Channel URL, `@handle`, or channel id (`UC...`)
      - max_results: How many recent videos to transcribe (default: 5)
      - languages: Optional preferred language codes, best first
+     - include_timestamps: Prefix each line with `[H:MM:SS]` (default: false)
+     - max_chars: Cap each transcript length; 0 = no cap (default: 0)
+
+### Handling IP blocks (`IpBlocked` / HTTP 429)
+
+YouTube rate-limits and blocks requests per IP — datacenter/cloud IPs get hit
+hardest. The server already mitigates this automatically:
+
+- **Retry with backoff** on transient blocks (`YT_RETRIES`, default 3).
+- **yt-dlp fallback** — if `youtube-transcript-api` is blocked, it fetches captions
+  through yt-dlp's session instead.
+
+If you still get blocked, set one or both of these env vars:
+
+```
+# Route requests through a proxy (best for cloud hosts on a banned IP)
+YT_PROXY=http://user:pass@host:port
+
+# Use an authenticated session — blocked far less. Export cookies to a
+# Netscape-format cookies.txt (e.g. with a browser extension) and point to it:
+YT_COOKIES=C:\path\to\cookies.txt
+```
+
+Both are honored by the transcript API and the yt-dlp fallback.
 
 ## Using with MCP Clients
 
