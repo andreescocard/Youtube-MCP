@@ -1,6 +1,6 @@
 # YouTube MCP Server
 
-A Model Context Protocol (MCP) server that provides tools for searching YouTube videos, retrieving transcripts, and performing semantic search over video content.
+A Model Context Protocol (MCP) server for reading a YouTube channel's latest videos and fetching their transcripts. **No API key required** — channel listing uses YouTube's public RSS feed and transcripts use `youtube-transcript-api` directly.
 
 ## Support Us
 
@@ -28,15 +28,13 @@ Your contributions go a long way in fueling our passion for creating intelligent
 
 ## Features
 
-- Search YouTube videos without using the official API
-- Retrieve video transcripts
-- Store video information and transcripts in a vector database
-- Perform semantic search over stored video transcripts
+- List a channel's most recent videos from a URL, `@handle`, or channel id — no API key
+- Retrieve a single video's transcript (auto language fallback)
+- Transcribe a channel's last N videos in one call
 
 ## Prerequisites
 
-- Python 3.8+
-- Google API key for embeddings
+- Python 3.10+
 - uv package manager
 
 ## Installation
@@ -54,12 +52,7 @@ source .venv/bin/activate
 
 3. Install dependencies using uv:
 ```bash
-uv pip install -r requirements.txt
-```
-
-4. Create a `.env` file with your Google API key:
-```
-GOOGLE_API_KEY=your_api_key_here
+uv sync
 ```
 
 ## Running the Server
@@ -81,24 +74,18 @@ Add to your Claude settings without using any package manager this works for win
 "mcpServers": {
   "youtube": {
     "command": "C:\\Path\\To\\Your\\Project\\.venv\\Scripts\\python.exe",
-    "args": ["C:\\Path\\To\\Your\\Project\\server.py"],
-    "env": {
-      "GOOGLE_API_KEY": "your_api_key_here"
-    }
+    "args": ["C:\\Path\\To\\Your\\Project\\server.py"]
   }
 }
 ```
 
-Using Uv package manager this works for windows:
+Using the uv package manager (works on Windows):
 
 ```json
 "mcpServers": {
   "youtube": {
     "command": "uv",
-    "args": ["--directory", "C:\\Path\\To\\Your\\Project", "run", "server.py"],
-    "env": {
-      "GOOGLE_API_KEY": "your_api_key_here"
-    }
+    "args": ["--directory", "C:\\Path\\To\\Your\\Project", "run", "server.py"]
   }
 }
 ```
@@ -107,24 +94,21 @@ Using Uv package manager this works for windows:
 
 The server provides the following tools:
 
-1. `search-youtube`: Search for YouTube videos based on a query
+1. `get-channel-videos`: List a channel's most recent videos
    - Parameters:
-     - query: Search query string
-     - max_results: Maximum number of results to return (default: 5)
+     - channel: Channel URL, `@handle`, or channel id (`UC...`)
+     - max_results: How many recent videos (default: 10)
 
-2. `get-transcript`: Get the transcript of a YouTube video
+2. `get-transcript`: Get the transcript of a single video
    - Parameters:
-     - video_url: URL of the YouTube video
+     - video_url: Video URL or 11-char video id
+     - languages: Optional preferred language codes, best first
 
-3. `store-video-info`: Store video information and transcript in the vector database
+3. `get-channel-transcripts`: Transcribe a channel's latest videos in one call
    - Parameters:
-     - video_url: URL of the YouTube video
-     - metadata: Optional metadata about the video
-
-4. `search-transcripts`: Search stored video transcripts using semantic search
-   - Parameters:
-     - query: Search query
-     - limit: Maximum number of results to return (default: 3)
+     - channel: Channel URL, `@handle`, or channel id (`UC...`)
+     - max_results: How many recent videos to transcribe (default: 5)
+     - languages: Optional preferred language codes, best first
 
 ## Using with MCP Clients
 
@@ -136,18 +120,18 @@ This server can be used with any MCP-compatible client, such as Claude Desktop A
 2. Open Claude Desktop App
 3. Look for the hammer icon to verify that the YouTube tools are available
 4. You can now use commands like:
-   - "Search for Python tutorial videos"
+   - "List the latest videos from https://www.youtube.com/@veritasium"
    - "Get the transcript of this video: [video_url]"
-   - "Search through stored video transcripts about machine learning"
+   - "Transcribe the last 5 videos from @veritasium"
 
 ## Debugging
 
 If you encounter any issues:
 
-1. Make sure your Google API key is correctly set in the `.env` file
-2. Check that all dependencies are installed correctly
-3. Verify that the server is running and listening for connections
-4. Look for any error messages in the server output
+1. Check that all dependencies are installed correctly (`uv sync`)
+2. Verify that the server is running and listening for connections
+3. Look for any error messages in the server output (logged to stderr)
+4. Some videos have subtitles disabled — that is reported per-video, not a server error
 
 ## Contributing
 

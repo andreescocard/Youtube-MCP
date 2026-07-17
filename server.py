@@ -1,277 +1,283 @@
-import os, sys
-from typing import List
-from mcp.server import Server
-from mcp.types import Tool, TextContent, ListToolsResult, INVALID_PARAMS
-from mcp.server.stdio import stdio_server
-from mcp.shared.exceptions import McpError
-from langchain_community.tools import YouTubeSearchTool
-from langchain_community.document_loaders import YoutubeLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import lancedb
+"""YouTube MCP Server.
+
+Tools for reading a channel's latest videos and fetching video transcripts.
+No API key required — channel listing uses YouTube's public RSS feed and
+transcripts use youtube-transcript-api directly.
+"""
+
+import os
+import re
+import sys
+import json
 import asyncio
-from dotenv import load_dotenv
 import logging
-from datetime import datetime
+from typing import List, Optional
+from urllib.parse import urlparse, parse_qs
 
-DATA_DIR = "./data"
+import requests
+from defusedxml import ElementTree as ET
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+from mcp.server.stdio import stdio_server
 
-# Ensure directories exist
-os.makedirs(DATA_DIR, exist_ok=True)
+from youtube_transcript_api import YouTubeTranscriptApi
 
-# Silence noisy third-party loggers
-for logger_name in ["asyncio", "urllib3.connectionpool", "mcp.server.lowlevel.server"]:
-    logging.getLogger(logger_name).setLevel(logging.WARNING)
-
-# Get current date for log filename
-log_filename = datetime.now().strftime('%d-%m-%y') + '.log'
-log_filepath = os.path.join(DATA_DIR, log_filename)
-
-# Configure our application logger with proper formatting
+# ---------------------------------------------------------------------------
+# Logging (stderr only — stdout is reserved for the MCP protocol)
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stderr,
+)
 logger = logging.getLogger("youtube-mcp")
-logger.setLevel(logging.DEBUG)  # Set our logger to DEBUG level
-logger.propagate = False  # Prevent double logging
 
-# Create a formatter with proper newlines
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+DEFAULT_LANGUAGES = [
+    "en", "es", "fr", "pt", "it", "de", "id", "zh", "zh-Hans", "zh-Hant",
+    "ko", "ja", "ar", "hi", "bn", "ru", "tr", "nl", "pl", "sw", "yo",
+]
 
-# Create and add console handler
-console_handler = logging.StreamHandler(sys.stderr)
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-# Create and add file handler for logging to file
-file_handler = logging.FileHandler(log_filepath)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+RSS_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+YT_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+    "media": "http://search.yahoo.com/mrss/",
+}
 
-load_dotenv()
 
-async def serve(read, write, options):
-    """Run the YouTube MCP server."""
-    logger.info("Initializing YouTube MCP Server")
-    server = Server(name="youtube-mcp-server")
-    logger.debug("Created MCP Server instance")
-    
-    youtube_search = YouTubeSearchTool()
-    logger.debug("Initialized YouTube Search Tool")
-    
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        task_type="retrieval_document"  # Set default task type for document storage
-    )
-    logger.debug("Initialized Google Generative AI Embeddings")
-    
-    db = lancedb.connect('youtube_db')
-    logger.debug("Connected to LanceDB database")
-    
-    # Create videos table if it doesn't exist
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def extract_video_id(url_or_id: str) -> Optional[str]:
+    """Return the 11-char video id from a URL or a bare id."""
+    s = url_or_id.strip()
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", s):
+        return s
     try:
-        videos_table = db.open_table("videos")
-        logger.debug("Opened existing videos table")
-    except:
-        import pyarrow as pa
-        videos_table = db.create_table(
-            "videos",
-            schema=pa.schema([
-                pa.field("id", pa.string(), nullable=False),
-                pa.field("text", pa.string()),
-                pa.field("metadata", pa.struct([]), nullable=True),  # JSON field as struct
-                pa.field("vector", pa.list_(pa.float32(), 768))  # Fixed-size list for vector
-            ]),
-            mode="create"
-        )
-        logger.debug("Created new videos table")
-    
-    def clean_text(text: str) -> str:
-        """Clean text to remove problematic characters."""
+        parsed = urlparse(s)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host.endswith("youtu.be"):
+        vid = parsed.path.lstrip("/").split("/")[0]
+        return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid) else None
+    if "youtube" in host:
+        if parsed.path.startswith(("/watch",)):
+            q = parse_qs(parsed.query).get("v", [None])[0]
+            if q and re.fullmatch(r"[0-9A-Za-z_-]{11}", q):
+                return q
+        m = re.search(r"/(?:embed|shorts|live|v)/([0-9A-Za-z_-]{11})", parsed.path)
+        if m:
+            return m.group(1)
+    m = re.search(r"([0-9A-Za-z_-]{11})", s)
+    return m.group(1) if m else None
+
+
+def resolve_channel_id(channel: str) -> str:
+    """Resolve any channel reference (id, URL, @handle) to a UC... channel id."""
+    s = channel.strip()
+
+    # Already a channel id.
+    if re.fullmatch(r"UC[0-9A-Za-z_-]{22}", s):
+        return s
+
+    m = re.search(r"/channel/(UC[0-9A-Za-z_-]{22})", s)
+    if m:
+        return m.group(1)
+
+    # Build a canonical URL to scrape the channelId from.
+    if s.startswith("http"):
+        page_url = s
+    elif s.startswith("@"):
+        page_url = f"https://www.youtube.com/{s}"
+    else:
+        page_url = f"https://www.youtube.com/@{s}"
+
+    resp = requests.get(page_url, headers=HTTP_HEADERS, timeout=20)
+    resp.raise_for_status()
+    html = resp.text
+    for pattern in (
+        r'"channelId":"(UC[0-9A-Za-z_-]{22})"',
+        r'<meta itemprop="(?:channelId|identifier)" content="(UC[0-9A-Za-z_-]{22})"',
+        r'/channel/(UC[0-9A-Za-z_-]{22})',
+    ):
+        m = re.search(pattern, html)
+        if m:
+            return m.group(1)
+    raise ValueError(f"Could not resolve channel id from: {channel}")
+
+
+def fetch_channel_videos(channel: str, max_results: int = 10) -> List[dict]:
+    """Return recent videos for a channel via its public RSS feed."""
+    cid = resolve_channel_id(channel)
+    resp = requests.get(RSS_FEED.format(cid=cid), headers=HTTP_HEADERS, timeout=20)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    channel_title = root.findtext("atom:title", default="", namespaces=YT_NS)
+    videos = []
+    for entry in root.findall("atom:entry", YT_NS):
+        vid = entry.findtext("yt:videoId", default="", namespaces=YT_NS)
+        videos.append({
+            "video_id": vid,
+            "title": entry.findtext("atom:title", default="", namespaces=YT_NS),
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "published": entry.findtext("atom:published", default="", namespaces=YT_NS),
+            "channel": channel_title,
+        })
+        if len(videos) >= max_results:
+            break
+    return videos
+
+
+def _snippet_text(seg) -> str:
+    # 1.x yields snippet objects (seg.text); older/raw dicts use seg["text"].
+    text = getattr(seg, "text", None)
+    if text is None and isinstance(seg, dict):
+        text = seg.get("text", "")
+    return (text or "").replace("\n", " ")
+
+
+def _to_text(entries) -> str:
+    return " ".join(_snippet_text(s) for s in entries).strip()
+
+
+def fetch_transcript(video_id: str, languages: List[str]) -> str:
+    """Fetch a transcript (youtube-transcript-api 1.x), falling back to any language."""
+    api = YouTubeTranscriptApi()
+
+    # Preferred languages first.
+    try:
+        return _to_text(api.fetch(video_id, languages=languages))
+    except Exception as first_err:  # NoTranscriptFound / language mismatch, etc.
+        logger.info("Preferred-language fetch failed for %s: %s", video_id, first_err)
+
+    # Fall back to whatever transcript exists (manual or auto-generated).
+    try:
+        listing = api.list(video_id)
+    except Exception as e:
+        raise RuntimeError(f"No transcript available for {video_id}: {e}")
+
+    for tr in listing:
         try:
-            # Replace emojis and special characters with their text equivalents
-            # or remove them if no good replacement exists
-            return text.encode('ascii', 'ignore').decode('ascii')
+            return _to_text(tr.fetch())
         except Exception:
-            return str(text)
+            continue
+    raise RuntimeError(f"No fetchable transcript for {video_id}")
 
-    # Register the list_tools handler
-    @server.list_tools()
-    async def list_tools() -> List[Tool]:
-        """Handle listing available tools"""
-        logger.info("Handling list_tools request")
-        tools = [
-            Tool(
-                name="search-youtube",
-                description="Search for YouTube videos based on a query",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query string"},
-                        "max_results": {"type": "integer", "description": "Maximum number of results to return", "default": 5}
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+server = Server(name="youtube-mcp-server")
+
+
+@server.list_tools()
+async def list_tools() -> List[Tool]:
+    return [
+        Tool(
+            name="get-channel-videos",
+            description="List a channel's most recent videos. Accepts a channel URL, @handle, or channel id (UC...).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel URL, @handle, or UC... id"},
+                    "max_results": {"type": "integer", "description": "How many recent videos", "default": 10},
+                },
+                "required": ["channel"],
+            },
+        ),
+        Tool(
+            name="get-transcript",
+            description="Get the transcript of a single YouTube video (URL or video id).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "video_url": {"type": "string", "description": "Video URL or 11-char video id"},
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Preferred language codes, best first",
                     },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="get-transcript",
-                description="Get the transcript of a YouTube video",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "video_url": {"type": "string", "description": "URL of the YouTube video"}
+                },
+                "required": ["video_url"],
+            },
+        ),
+        Tool(
+            name="get-channel-transcripts",
+            description="Get transcripts for a channel's latest videos in one call. Your go-to tool for 'transcribe the last N videos of this channel'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel URL, @handle, or UC... id"},
+                    "max_results": {"type": "integer", "description": "How many recent videos to transcribe", "default": 5},
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Preferred language codes, best first",
                     },
-                    "required": ["video_url"]
-                }
-            ),
-            Tool(
-                name="store-video-info",
-                description="Store video information and transcript in the vector database",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "video_url": {"type": "string", "description": "URL of the YouTube video"},
-                        "metadata": {"type": "object", "description": "Optional metadata about the video"}
-                    },
-                    "required": ["video_url"]
-                }
-            ),
-            Tool(
-                name="search-transcripts",
-                description="Search stored video transcripts using semantic search",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "limit": {"type": "integer", "description": "Maximum number of results to return", "default": 3}
-                    },
-                    "required": ["query"]
-                }
+                },
+                "required": ["channel"],
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> List[TextContent]:
+    logger.info("Tool call: %s %s", name, arguments)
+    languages = arguments.get("languages") or DEFAULT_LANGUAGES
+
+    try:
+        if name == "get-channel-videos":
+            videos = await asyncio.to_thread(
+                fetch_channel_videos, arguments["channel"], int(arguments.get("max_results", 10))
             )
-        ]
-        logger.debug(f"Returning {len(tools)} tools: {[tool.name for tool in tools]}")
-        return tools
+            return [TextContent(type="text", text=json.dumps(videos, ensure_ascii=False, indent=2))]
 
-    # Register the call_tool handler
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        try:
-            logger.info(f"Handling tool call: {name} with arguments: {arguments}")
+        if name == "get-transcript":
+            vid = extract_video_id(arguments["video_url"])
+            if not vid:
+                return [TextContent(type="text", text=f"Could not parse a video id from: {arguments['video_url']}")]
+            text = await asyncio.to_thread(fetch_transcript, vid, languages)
+            return [TextContent(type="text", text=text or "No transcript found for this video.")]
 
-            if name == "search-youtube":
-                max_results = int(arguments.get("max_results", 5))
-                results = youtube_search.run(f"{arguments['query']},{max_results}")
-                # Properly parse and clean results
-                parsed_results = eval(results)  # Consider using json.loads() if results are JSON
-                cleaned_results = clean_text(str(parsed_results))
-                return [TextContent(type="text", text=cleaned_results)]
-            
-            elif name == "get-transcript":
-                languages = ["en", "es", "fr", "pt", "it", "id", "de", "zh", "ko", "ja", "ar", "hi", "bn", "sw", "yo"]  # English, Spanish, French, Portuguese, Italian, Indonesian, German, Chinese, Korean, Japanese, Arabic, Hindi, Bengali, Swahili, Yoruba
-                # Extract video_id from URL, handling URLs with additional parameters
-                video_url = arguments["video_url"] if len(arguments["video_url"].split("&")) == 1 else arguments["video_url"].split("&")[0]  # Extract video_id from URL when the url is like https://www.youtube.com/watch?v=VIDEO_ID&...
-                # Use YoutubeLoader with languages parameter
-                loader = YoutubeLoader.from_youtube_url(
-                    youtube_url=video_url,
-                    language=languages,
-                    add_video_info=False,
-                    continue_on_failure=True
-                )
-                # Load transcript and extract text
-                documents = loader.load()
-                if documents:
-                    transcript_text = documents[0].page_content
-                    cleaned_transcript = clean_text(transcript_text)
-                    return [TextContent(type="text", text=cleaned_transcript)]
-                else:
-                    return [TextContent(type="text", text="No transcript found for this video.")]
-            
-            elif name == "store-video-info":
-                languages = ["en", "es", "fr", "pt", "it", "id", "de", "zh", "ko", "ja", "ar", "hi", "bn", "sw", "yo"]
-                # Extract video_id from URL, handling URLs with additional parameters
-                video_url = arguments["video_url"] if len(arguments["video_url"].split("&")) == 1 else arguments["video_url"].split("&")[0]  # Extract video_id from URL when the url is like https://www.youtube.com/watch?v=VIDEO_ID&...
-                # Use YoutubeLoader with languages parameter
-                loader = YoutubeLoader.from_youtube_url(
-                    youtube_url=video_url,
-                    language=languages,
-                    add_video_info=True,
-                    continue_on_failure=True
-                )
-                # Load transcript and extract text
-                documents = loader.load()
-                if documents:
-                    transcript_text = documents[0].page_content
-                    cleaned_content = clean_text(transcript_text)
-                    vector = embeddings.embed_documents(
-                        [cleaned_content],
-                        task_type="retrieval_document"
-                    )[0]
-                    # Use provided metadata and add video metadata from document if available
-                    cleaned_metadata = {
-                        k: clean_text(str(v)) if isinstance(v, str) else v
-                        for k, v in arguments.get("metadata", {}).items()
-                    }
-                    # Add video_id to metadata
-                    cleaned_metadata["video_id"] = YoutubeLoader.extract_video_id(youtube_url=video_url)
-                    videos_table.add([{
-                        "id": video_url,
-                        "text": cleaned_content,
-                        "metadata": cleaned_metadata,
-                        "vector": vector
-                    }])
-                    return [TextContent(type="text", text=f"Successfully stored video information for {cleaned_metadata.get('video_id')}")]
-                else:
-                    return [TextContent(type="text", text="No transcript found for this video.")]
-                
-            elif name == "search-transcripts":
-                query_vector = embeddings.embed_query(
-                    arguments["query"],
-                    task_type="retrieval_query"
-                )
-                results = videos_table.search(
-                    query_vector
-                ).limit(int(arguments.get("limit", 3))).to_pandas()
-                
-                formatted_results = []
-                for result in results.itertuples():
-                    formatted_results.append({
-                        "video_url": result.id,
-                        "metadata": getattr(result, "metadata", {}),
-                        "text_sample": result.text[:200] + "..." if len(result.text) > 200 else result.text,
-                        "score": float(getattr(result, "_4", 0.0))  # LanceDB score is in the last column
-                    })
-                return [TextContent(type="text", text=str(formatted_results))]
-                
-            else:
-                raise ValueError(f"Unknown tool: {name}")
-                
-        except Exception as e:
-            logger.error(f"Error handling tool call: {e}", exc_info=True)
-            raise McpError(INVALID_PARAMS, str(e))
+        if name == "get-channel-transcripts":
+            max_results = int(arguments.get("max_results", 5))
+            videos = await asyncio.to_thread(fetch_channel_videos, arguments["channel"], max_results)
+            out = []
+            for v in videos:
+                try:
+                    text = await asyncio.to_thread(fetch_transcript, v["video_id"], languages)
+                except Exception as e:
+                    text = None
+                    v["error"] = str(e)
+                out.append({**v, "transcript": text})
+            return [TextContent(type="text", text=json.dumps(out, ensure_ascii=False, indent=2))]
 
-    # Create initialization options
-    options = server.create_initialization_options()
-    logger.debug(f"Created initialization options: {options}")
-    
-    # Properly use stdio_server as an async context manager
-    await server.run(read, write, options, raise_exceptions=True)
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    except Exception as e:
+        logger.error("Error in %s: %s", name, e, exc_info=True)
+        return [TextContent(type="text", text=f"Error: {e}")]
+
 
 async def main():
-    try:
-        logger.info("Starting YouTube MCP Server...")
-        options = {
-            "protocolVersion": "0.1.0",
-            "capabilities": {}
-        }
-        async with stdio_server() as (read, write):
-            await serve(read, write, options)
-    except KeyboardInterrupt:
-        logger.info("Server shutting down gracefully...")
-        print("\nServer shutting down gracefully...", file=sys.stderr)
-    except Exception as e:
-        logger.error(f"Fatal error occurred: {e}", exc_info=True)
-        print(f"\nFatal error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
+    logger.info("Starting YouTube MCP Server...")
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Server shutting down...")
+        print("Server shutting down...", file=sys.stderr)
