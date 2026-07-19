@@ -264,6 +264,15 @@ def _pick_caption_lang(tracks: dict, languages: List[str]) -> str:
     return next(iter(tracks))
 
 
+def _yt_dlp_opts() -> dict:
+    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    if _PROXY_URL:
+        opts["proxy"] = _PROXY_URL
+    if _COOKIES:
+        opts["cookiefile"] = _COOKIES
+    return opts
+
+
 def _ytdlp_snippets(video_id: str, languages: List[str]):
     """Fallback path: single metadata call, then fetch one json3 track via yt-dlp's session.
 
@@ -272,12 +281,7 @@ def _ytdlp_snippets(video_id: str, languages: List[str]):
     """
     import yt_dlp
 
-    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
-    if _PROXY_URL:
-        opts["proxy"] = _PROXY_URL
-    if _COOKIES:
-        opts["cookiefile"] = _COOKIES
-
+    opts = _yt_dlp_opts()
     url = f"https://www.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -322,9 +326,42 @@ def get_snippets(video_id: str, languages: List[str]):
         raise RuntimeError(f"No transcript for {video_id}: yta={last}; yt-dlp={e}")
 
 
+AD_CHAPTER_RE = re.compile(r"\b(sponsor\w*|advert\w*|promo\w*|ads?)\b", re.IGNORECASE)
+
+
+def _fetch_ad_chapters(video_id: str) -> List[dict]:
+    """Video chapters whose title looks like a sponsor/ad segment (best-effort)."""
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(_yt_dlp_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+    chapters = info.get("chapters") or []
+    return [c for c in chapters if AD_CHAPTER_RE.search(c.get("title") or "")]
+
+
+def _strip_ad_snippets(snippets, ad_chapters: List[dict]):
+    if not ad_chapters:
+        return snippets
+    return [
+        seg for seg in snippets
+        if not any(
+            c["start_time"] <= float(_snippet_field(seg, "start", 0.0)) < c["end_time"]
+            for c in ad_chapters
+        )
+    ]
+
+
 def fetch_transcript(video_id: str, languages: List[str],
-                     include_timestamps: bool = False, max_chars: int = 0) -> str:
-    return format_transcript(get_snippets(video_id, languages), include_timestamps, max_chars)
+                     include_timestamps: bool = False, max_chars: int = 0,
+                     strip_ads: bool = False) -> str:
+    snippets = get_snippets(video_id, languages)
+    if strip_ads:
+        try:
+            snippets = _strip_ad_snippets(snippets, _fetch_ad_chapters(video_id))
+        except Exception as e:
+            logger.info("Could not fetch chapters for %s to strip ads: %s", video_id, e)
+    return format_transcript(snippets, include_timestamps, max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +399,11 @@ async def list_tools() -> List[Tool]:
                     },
                     "include_timestamps": {"type": "boolean", "description": "Prefix each line with [H:MM:SS]", "default": False},
                     "max_chars": {"type": "integer", "description": "Cap output length; 0 = no cap", "default": 0},
+                    "strip_ads": {
+                        "type": "boolean",
+                        "description": "Drop lines that fall inside sponsor/ad chapter markers (best-effort, needs chapters)",
+                        "default": False,
+                    },
                 },
                 "required": ["video_url"],
             },
@@ -381,6 +423,11 @@ async def list_tools() -> List[Tool]:
                     },
                     "include_timestamps": {"type": "boolean", "description": "Prefix each line with [H:MM:SS]", "default": False},
                     "max_chars": {"type": "integer", "description": "Cap each transcript length; 0 = no cap", "default": 0},
+                    "strip_ads": {
+                        "type": "boolean",
+                        "description": "Drop lines that fall inside sponsor/ad chapter markers (best-effort, needs chapters)",
+                        "default": False,
+                    },
                 },
                 "required": ["channel"],
             },
@@ -394,6 +441,7 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     languages = arguments.get("languages") or DEFAULT_LANGUAGES
     ts = bool(arguments.get("include_timestamps", False))
     max_chars = int(arguments.get("max_chars", 0))
+    strip_ads = bool(arguments.get("strip_ads", False))
 
     try:
         if name == "get-channel-videos":
@@ -406,7 +454,7 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
             vid = extract_video_id(arguments["video_url"])
             if not vid:
                 return [TextContent(type="text", text=f"Could not parse a video id from: {arguments['video_url']}")]
-            text = await asyncio.to_thread(fetch_transcript, vid, languages, ts, max_chars)
+            text = await asyncio.to_thread(fetch_transcript, vid, languages, ts, max_chars, strip_ads)
             return [TextContent(type="text", text=text or "No transcript found for this video.")]
 
         if name == "get-channel-transcripts":
@@ -415,7 +463,7 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
             out = []
             for v in videos:
                 try:
-                    text = await asyncio.to_thread(fetch_transcript, v["video_id"], languages, ts, max_chars)
+                    text = await asyncio.to_thread(fetch_transcript, v["video_id"], languages, ts, max_chars, strip_ads)
                 except Exception as e:
                     text = None
                     v["error"] = str(e)
