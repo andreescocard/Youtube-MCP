@@ -105,6 +105,7 @@ The server provides the following tools:
      - languages: Optional preferred language codes, best first
      - include_timestamps: Prefix each line with `[H:MM:SS]` (default: false)
      - max_chars: Cap output length; 0 = no cap (default: 0)
+     - strip_ads: Drop lines inside sponsor/ad chapter markers (default: false, best-effort — needs the video to have chapters)
 
 3. `get-channel-transcripts`: Transcribe a channel's latest videos in one call
    - Parameters:
@@ -113,6 +114,7 @@ The server provides the following tools:
      - languages: Optional preferred language codes, best first
      - include_timestamps: Prefix each line with `[H:MM:SS]` (default: false)
      - max_chars: Cap each transcript length; 0 = no cap (default: 0)
+     - strip_ads: Drop lines inside sponsor/ad chapter markers (default: false, best-effort — needs the video to have chapters)
 
 ### Handling IP blocks (`IpBlocked` / HTTP 429)
 
