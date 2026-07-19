@@ -136,6 +136,13 @@ YT_COOKIES=C:\path\to\cookies.txt
 
 Both are honored by the transcript API and the yt-dlp fallback.
 
+Note: cookies help but are not a guaranteed fix — YouTube's bot-check
+("Sign in to confirm you're not a bot") is largely IP-reputation based, and
+most cloud/VPS datacenter IPs stay blocked even with a valid session. If
+transcripts still fail after adding `YT_COOKIES`, `YT_PROXY` (routing through
+a residential/ISP proxy) is the reliable fix — cookies alone rarely clear a
+block on a flagged datacenter IP.
+
 ## Using with MCP Clients
 
 This server can be used with any MCP-compatible client, such as Claude Desktop App. The tools will be automatically discovered and made available to the client.

@@ -70,6 +70,29 @@ def _proxy_config():
         return None
 
 
+def _http_client() -> requests.Session:
+    """Session for youtube-transcript-api, with cookies loaded if YT_COOKIES is set.
+
+    youtube-transcript-api itself no longer loads cookies (disabled upstream), so
+    without this the primary path always went out unauthenticated even when
+    YT_COOKIES was configured — only the yt-dlp fallback ever saw them. Cookies
+    are parsed with yt-dlp's own Netscape parser rather than the stdlib one:
+    stdlib http.cookiejar.MozillaCookieJar silently drops lines prefixed with
+    "#HttpOnly_", which is exactly where YouTube's auth cookies live.
+    """
+    session = requests.Session()
+    session.headers.update(HTTP_HEADERS)
+    if _COOKIES:
+        try:
+            from yt_dlp.cookies import YoutubeDLCookieJar
+            jar = YoutubeDLCookieJar(_COOKIES)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+        except Exception as e:
+            logger.warning("Could not load cookies from %s: %s", _COOKIES, e)
+    return session
+
+
 RSS_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
 YT_NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -202,7 +225,7 @@ def _is_block(err: Exception) -> bool:
 
 def _yta_snippets(video_id: str, languages: List[str]):
     """Primary path: youtube-transcript-api, preferred language then any."""
-    api = YouTubeTranscriptApi(proxy_config=_proxy_config())
+    api = YouTubeTranscriptApi(proxy_config=_proxy_config(), http_client=_http_client())
     try:
         return list(api.fetch(video_id, languages=languages))
     except Exception as first_err:
