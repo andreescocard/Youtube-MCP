@@ -1,13 +1,22 @@
 [project]
 name = "mcp-youtube"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server for YouTube channel listings and video transcripts, no API key required"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.2.0",
-    "requests>=2.31.0",
+    "mcp>=1.9.0,<2",
+    "requests[socks]>=2.31.0",
     "defusedxml>=0.7.1",
     "youtube-transcript-api>=1.0.0",
     "yt-dlp>=2024.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.9.0",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
